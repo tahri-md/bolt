@@ -3,7 +3,11 @@ package service
 import (
 	"bolt/models"
 	"container/list"
+	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -31,6 +35,51 @@ func NewCacheService(maxSize int64, evictionPolicy string) *CacheService {
 	}
 }
 
+func (s *CacheService) StartTTLCleanup(ctx context.Context) {
+	ticker := time.NewTicker(s.cache.TTLManager.Interval)
+	defer ticker.Stop()
+
+	log.Println("TTL cleanup goroutine started")
+
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanupExpired()
+		case <-ctx.Done():
+			log.Println("TTL cleanup goroutine stopped")
+			return
+		}
+	}
+}
+
+func (s *CacheService) cleanupExpired() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+
+	expired := make([]string, 0)
+	for key, expiry := range s.cache.TTLManager.Entries {
+		if now.After(expiry) {
+			expired = append(expired, key)
+		}
+	}
+
+	for _, key := range expired {
+		element, exists := s.cache.Store[key]
+		if !exists {
+			delete(s.cache.TTLManager.Entries, key)
+			continue
+		}
+		s.removeElement(element)
+		s.cache.Metrics.Evictions++
+	}
+
+	if len(expired) > 0 {
+		log.Printf("TTL cleanup: removed %d expired entries", len(expired))
+	}
+}
+
 func (s *CacheService) Get(key string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -52,6 +101,13 @@ func (s *CacheService) Get(key string) (string, error) {
 			s.updateHitRate()
 			return "", errors.New("cache entry expired")
 		}
+	}
+
+	if entry.Checksum != "" && computeChecksum(entry.Value) != entry.Checksum {
+		s.removeElement(element)
+		s.cache.Metrics.Misses++
+		s.updateHitRate()
+		return "", errors.New("cache entry corrupted: checksum mismatch")
 	}
 
 	s.cache.AccessOrder.MoveToFront(element)
@@ -79,7 +135,7 @@ func (s *CacheService) Set(key string, value string, ttl time.Duration) error {
 		LastAccessed: time.Now(),
 		AccessCount:  0,
 		TTL:          ttl,
-		Checksum:     "",
+		Checksum:     computeChecksum(value),
 		Size:         len(value),
 	}
 
@@ -202,4 +258,9 @@ func (s *CacheService) updateHitRate() {
 	if total > 0 {
 		s.cache.Metrics.HitRate = float64(s.cache.Metrics.Hits) / float64(total)
 	}
+}
+
+func computeChecksum(value string) string {
+	hash := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", hash)
 }

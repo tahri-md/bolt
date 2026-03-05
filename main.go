@@ -3,6 +3,7 @@ package main
 import (
 	"bolt/routes"
 	"bolt/service"
+	"context"
 	"log"
 
 	"github.com/gin-gonic/gin"
@@ -10,13 +11,15 @@ import (
 
 func main() {
 	r := gin.Default()
-
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	nodeService := service.NewNodeService()
 	// LRU eviction
 	cacheService := service.NewCacheService(1024*1024, "LRU")
 
 	// LFU eviction
 	//cacheService := service.NewCacheService(1024*1024, "LFU")
+	cacheService.StartTTLCleanup(ctx)
 	routes.RegisterNodeRoutes(r, nodeService)
 	routes.RegisterCacheRoutes(r, cacheService)
 
