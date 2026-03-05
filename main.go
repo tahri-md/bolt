@@ -12,10 +12,13 @@ func main() {
 	r := gin.Default()
 
 	nodeService := service.NewNodeService()
-	cacheEntryService := service.NewCacheEntryService()
+	// LRU eviction
+	cacheService := service.NewCacheService(1024*1024, "LRU")
 
+	// LFU eviction
+	//cacheService := service.NewCacheService(1024*1024, "LFU")
 	routes.RegisterNodeRoutes(r, nodeService)
-	routes.RegisterCacheEntryRoutes(r, cacheEntryService)
+	routes.RegisterCacheRoutes(r, cacheService)
 
 	log.Println("Starting server on :8080")
 	if err := r.Run(":8080"); err != nil {

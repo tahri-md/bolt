@@ -7,15 +7,15 @@ import (
 )
 
 type Cache struct {
-	mu             sync.RWMutex           `json:"-"`
-	Store          map[string]*CacheEntry `json:"-"`
-	MaxSize        int64                  `json:"max_size"`
-	CurrentSize    int64                  `json:"current_size"`
-	EvictionPolicy string                 `json:"eviction_policy"`
-	AccessOrder    *list.List             `json:"-"`
-	FrequencyMap   map[string]int64       `json:"-"`
-	TTLManager     *TTLManager            `json:"-"`
-	Metrics        *CacheMetrics          `json:"metrics,omitempty"`
+	mu             sync.RWMutex             `json:"-"`
+	Store          map[string]*list.Element `json:"-"`
+	MaxSize        int64                    `json:"max_size"`
+	CurrentSize    int64                    `json:"current_size"`
+	EvictionPolicy string                   `json:"eviction_policy"`
+	AccessOrder    *list.List               `json:"-"`
+	FrequencyMap   map[string]int64         `json:"-"`
+	TTLManager     *TTLManager              `json:"-"`
+	Metrics        *CacheMetrics            `json:"metrics,omitempty"`
 }
 
 type CacheMetrics struct {
