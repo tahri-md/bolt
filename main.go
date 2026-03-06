@@ -20,7 +20,7 @@ func main() {
 	// create coordinator: 150 virtual nodes, replication factor 2, 1MB per node, LRU
 	coordinator := service.NewCoordinatorService(150, 2, 1024*1024, "LRU")
 
-	// register nodes
+	// register initial nodes
 	coordinator.AddNode(&models.Node{
 		ID:            "node-1",
 		Address:       "localhost",
@@ -42,8 +42,8 @@ func main() {
 
 	// start TTL cleanup for all nodes
 	coordinator.StartAllTTLCleanup(ctx)
-
-	routes.RegisterNodeRoutes(r, service.NewNodeService())
+	go coordinator.StartHealthMonitor(ctx)
+	routes.RegisterNodeRoutes(r, coordinator)
 	routes.RegisterCacheRoutes(r, coordinator)
 
 	log.Println("Starting server on :8080")

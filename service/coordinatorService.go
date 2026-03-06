@@ -4,28 +4,94 @@ import (
 	"bolt/models"
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 )
 
 type CoordinatorService struct {
-	mu             sync.RWMutex
-	hashRing       *HashRingService
-	caches         map[string]*CacheService
-	nodes          map[string]*models.Node
-	maxCacheSize   int64
-	evictionPolicy string
+	mu               sync.RWMutex
+	hashRing         *HashRingService
+	caches           map[string]*CacheService
+	nodes            map[string]*models.Node
+	maxCacheSize     int64
+	evictionPolicy   string
+	heartbeatTimeout time.Duration
 }
 
 func NewCoordinatorService(vnodes int, replicationFactor int, maxCacheSize int64, evictionPolicy string) *CoordinatorService {
 	return &CoordinatorService{
-		hashRing:       NewHashRingService(vnodes, replicationFactor),
-		caches:         make(map[string]*CacheService),
-		nodes:          make(map[string]*models.Node),
-		maxCacheSize:   maxCacheSize,
-		evictionPolicy: evictionPolicy,
+		hashRing:         NewHashRingService(vnodes, replicationFactor),
+		caches:           make(map[string]*CacheService),
+		nodes:            make(map[string]*models.Node),
+		maxCacheSize:     maxCacheSize,
+		evictionPolicy:   evictionPolicy,
+		heartbeatTimeout: 15 * time.Second,
 	}
 }
+
+// --- health monitoring ---
+
+func (c *CoordinatorService) StartHealthMonitor(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	log.Println("Health monitor started")
+
+	for {
+		select {
+		case <-ticker.C:
+			c.checkNodeHealth()
+		case <-ctx.Done():
+			log.Println("Health monitor stopped")
+			return
+		}
+	}
+}
+
+func (c *CoordinatorService) checkNodeHealth() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+
+	for id, node := range c.nodes {
+		if now.Sub(node.LastHeartbeat) > c.heartbeatTimeout {
+			if node.Status == "active" {
+				node.Status = "inactive"
+				log.Printf("Node %s marked as inactive (no heartbeat for %v)", id, c.heartbeatTimeout)
+			}
+		}
+	}
+}
+
+func (c *CoordinatorService) UpdateHeartbeat(nodeID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	node, exists := c.nodes[nodeID]
+	if !exists {
+		return errors.New("node not found")
+	}
+
+	node.LastHeartbeat = time.Now()
+	if node.Status == "inactive" {
+		node.Status = "active"
+		log.Printf("Node %s is back online", nodeID)
+	}
+
+	return nil
+}
+
+func (c *CoordinatorService) isNodeActive(nodeID string) bool {
+	node, exists := c.nodes[nodeID]
+	if !exists {
+		return false
+	}
+	return node.Status == "active"
+}
+
+// --- node management ---
 
 func (c *CoordinatorService) AddNode(node *models.Node) error {
 	if node == nil || node.ID == "" {
@@ -63,6 +129,8 @@ func (c *CoordinatorService) RemoveNode(nodeID string) error {
 	return nil
 }
 
+// --- cache operations ---
+
 func (c *CoordinatorService) Set(key string, value string, ttl time.Duration) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -72,8 +140,12 @@ func (c *CoordinatorService) Set(key string, value string, ttl time.Duration) er
 		return err
 	}
 
+	wrote := false
 	var lastErr error
 	for _, node := range nodes {
+		if !c.isNodeActive(node.ID) {
+			continue
+		}
 		cache, exists := c.caches[node.ID]
 		if !exists {
 			lastErr = errors.New("cache not found for node: " + node.ID)
@@ -81,10 +153,19 @@ func (c *CoordinatorService) Set(key string, value string, ttl time.Duration) er
 		}
 		if err := cache.Set(key, value, ttl); err != nil {
 			lastErr = err
+			continue
 		}
+		wrote = true
 	}
 
-	return lastErr
+	if !wrote {
+		if lastErr != nil {
+			return lastErr
+		}
+		return errors.New("no active nodes available")
+	}
+
+	return nil
 }
 
 func (c *CoordinatorService) Get(key string) (string, error) {
@@ -97,15 +178,17 @@ func (c *CoordinatorService) Get(key string) (string, error) {
 		return "", err
 	}
 
-	cache, exists := c.caches[primaryNode.ID]
-	if exists {
-		val, err := cache.Get(key)
-		if err == nil {
-			return val, nil
+	if c.isNodeActive(primaryNode.ID) {
+		cache, exists := c.caches[primaryNode.ID]
+		if exists {
+			val, err := cache.Get(key)
+			if err == nil {
+				return val, nil
+			}
 		}
 	}
 
-	// primary failed — try replicas
+	// primary failed or inactive — try replicas
 	nodes, err := c.hashRing.GetReplicaNodes(key, c.hashRing.hashRing.ReplicationFactor)
 	if err != nil {
 		return "", err
@@ -113,7 +196,10 @@ func (c *CoordinatorService) Get(key string) (string, error) {
 
 	for _, node := range nodes {
 		if node.ID == primaryNode.ID {
-			continue // already tried
+			continue
+		}
+		if !c.isNodeActive(node.ID) {
+			continue
 		}
 		cache, exists := c.caches[node.ID]
 		if !exists {
@@ -125,7 +211,7 @@ func (c *CoordinatorService) Get(key string) (string, error) {
 		}
 	}
 
-	return "", errors.New("key not found on any node")
+	return "", errors.New("key not found on any active node")
 }
 
 func (c *CoordinatorService) Delete(key string) error {
@@ -139,6 +225,9 @@ func (c *CoordinatorService) Delete(key string) error {
 
 	var lastErr error
 	for _, node := range nodes {
+		if !c.isNodeActive(node.ID) {
+			continue
+		}
 		cache, exists := c.caches[node.ID]
 		if !exists {
 			lastErr = errors.New("cache not found for node: " + node.ID)
@@ -160,6 +249,8 @@ func (c *CoordinatorService) Flush() {
 		cache.Flush()
 	}
 }
+
+// --- query helpers ---
 
 func (c *CoordinatorService) GetAllNodes() []*models.Node {
 	c.mu.RLock()
